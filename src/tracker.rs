@@ -267,7 +267,9 @@ fn https_get(_u: &Url, _path: &str) -> Result<Vec<u8>> {
 }
 
 pub fn parse_compact_v4(b: &[u8]) -> Vec<SocketAddr> {
-    b.chunks_exact(6)
+    b.as_chunks::<6>()
+        .0
+        .iter()
         .map(|c| {
             SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(c[0], c[1], c[2], c[3])),
@@ -279,7 +281,9 @@ pub fn parse_compact_v4(b: &[u8]) -> Vec<SocketAddr> {
 }
 
 pub fn parse_compact_v6(b: &[u8]) -> Vec<SocketAddr> {
-    b.chunks_exact(18)
+    b.as_chunks::<18>()
+        .0
+        .iter()
         .map(|c| {
             let ip: [u8; 16] = c[..16].try_into().unwrap();
             SocketAddr::new(
