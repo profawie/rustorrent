@@ -359,7 +359,7 @@ impl Dht {
                     }
                 }
                 if let Some(nodes) = r.get("nodes").and_then(Value::bytes) {
-                    for c in nodes.chunks_exact(26) {
+                    for c in nodes.as_chunks::<26>().0 {
                         let nid: Id = c[..20].try_into().unwrap();
                         let addr = SocketAddr::new(
                             IpAddr::V4(Ipv4Addr::new(c[20], c[21], c[22], c[23])),

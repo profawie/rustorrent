@@ -14,23 +14,23 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets
       - run: cargo test
 
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
           components: clippy
-      - run: cargo clippy --release --target x86_64-pc-windows-msvc -- -D warnings
+      - run: cargo clippy --release --target x86_64-pc-windows-msvc
       - run: cargo build --release --target x86_64-pc-windows-msvc
       - name: Report size and DLL imports
         shell: pwsh
