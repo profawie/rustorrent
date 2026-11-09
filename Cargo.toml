@@ -1,0 +1,41 @@
+[package]
+name = "rustorrent"
+version = "0.1.0"
+description = "Small, fast, portable BitTorrent client for Windows"
+edition = "2024"
+
+[dependencies]
+sha1_smol = "1.0.1"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+debug = false
+incremental = false
+
+# Hashing is the hot path: optimise it for speed even in the size-optimised build.
+[profile.release.package.sha1_smol]
+opt-level = 3
