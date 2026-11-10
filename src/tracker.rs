@@ -27,6 +27,8 @@ pub struct Announce<'a> {
 pub struct Response {
     pub interval: u64,
     pub peers: Vec<SocketAddr>,
+    pub seeders: Option<u32>,
+    pub leechers: Option<u32>,
 }
 
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -160,7 +162,7 @@ fn http_get(u: &Url, path: &str) -> Result<Vec<u8>> {
     Err(last_err)
 }
 
-fn dechunk(mut b: &[u8]) -> Vec<u8> {
+pub fn dechunk(mut b: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some(i) = b.windows(2).position(|w| w == b"\r\n") {
         let line = String::from_utf8_lossy(&b[..i]);
@@ -327,7 +329,17 @@ fn parse_http_response(body: &[u8]) -> Result<Response> {
     if let Some(b) = v.get("peers6").and_then(Value::bytes) {
         peers.extend(parse_compact_v6(b));
     }
-    Ok(Response { interval, peers })
+    let count = |k: &str| {
+        v.get(k)
+            .and_then(Value::int)
+            .map(|n| n.clamp(0, u32::MAX as i64) as u32)
+    };
+    Ok(Response {
+        interval,
+        peers,
+        seeders: count("complete"),
+        leechers: count("incomplete"),
+    })
 }
 
 fn udp_announce(url: &str, a: &Announce) -> Result<Response> {
@@ -403,12 +415,19 @@ fn udp_announce(url: &str, a: &Announce) -> Result<Response> {
     req.extend_from_slice(&a.port.to_be_bytes());
     let n = transact(&req, txid, 20, &mut buf)?;
     let interval = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as u64;
+    let leechers = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+    let seeders = u32::from_be_bytes(buf[16..20].try_into().unwrap());
     let peers = if addr.is_ipv4() {
         parse_compact_v4(&buf[20..n])
     } else {
         parse_compact_v6(&buf[20..n])
     };
-    Ok(Response { interval, peers })
+    Ok(Response {
+        interval,
+        peers,
+        seeders: Some(seeders),
+        leechers: Some(leechers),
+    })
 }
 
 #[cfg(test)]

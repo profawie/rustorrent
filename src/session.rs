@@ -6,13 +6,14 @@ use crate::conn;
 use crate::dht::Dht;
 use crate::magnet;
 use crate::metainfo::Metainfo;
-use crate::torrent::{Ctx, Stats, Torrent};
+use crate::portmap::PortMapper;
+use crate::torrent::{Ctx, Details, Stats, Torrent};
 use crate::tracker::parse_compact_v4;
 use crate::util::{Result, hex, rand_bytes};
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU64, Ordering::*};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +26,35 @@ pub struct Config {
     pub download_dir: PathBuf,
 }
 
+/// User-adjustable settings (the Settings dialog).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Settings {
+    /// Listening port; 0 = pick automatically. Takes effect after a restart.
+    pub port: u16,
+    /// Forward the port on the router with UPnP / NAT-PMP.
+    pub upnp: bool,
+    /// Takes effect after a restart.
+    pub dht: bool,
+    /// One of `mse::ENC_*`.
+    pub encryption: u8,
+    /// Bytes per second, 0 = unlimited.
+    pub down_limit: u64,
+    pub up_limit: u64,
+    pub max_conns: usize,
+    pub max_peers: usize,
+    pub download_dir: PathBuf,
+    /// Show the file selection dialog when adding a torrent (GUI only).
+    pub ask_files: bool,
+}
+
+/// Options for adding a torrent.
+#[derive(Default)]
+pub struct AddOptions {
+    pub save_dir: Option<PathBuf>,
+    pub file_prio: Option<Vec<u8>>,
+    pub paused: bool,
+}
+
 pub struct Session {
     ctx: Arc<Ctx>,
     torrents: Arc<Mutex<Vec<Arc<Torrent>>>>,
@@ -33,6 +63,8 @@ pub struct Session {
     persist: bool,
     pub download_dir: Mutex<PathBuf>,
     save_lock: Mutex<()>,
+    settings: Mutex<Settings>,
+    portmap: Mutex<Option<Arc<PortMapper>>>,
 }
 
 const STATE_FILE: &str = "state.dat";
@@ -71,18 +103,37 @@ impl Session {
         } else {
             None
         };
-        let saved_port = saved
-            .as_ref()
-            .and_then(|s| s.get("port"))
-            .and_then(Value::int)
-            .unwrap_or(0) as u16;
-        let listener = bind_listener(if cfg.port != 0 { cfg.port } else { saved_port });
+        let int = |k: &str| saved.as_ref().and_then(|s| s.get(k)).and_then(Value::int);
+        let saved_port = int("port").unwrap_or(0) as u16;
+        let mut settings = Settings {
+            port: int("listen_port").unwrap_or(0).clamp(0, 65535) as u16,
+            upnp: int("upnp").unwrap_or(1) != 0,
+            dht: int("dht").unwrap_or(1) != 0,
+            encryption: int("encryption").unwrap_or(0).clamp(0, 2) as u8,
+            down_limit: int("down_limit").unwrap_or(0).max(0) as u64,
+            up_limit: int("up_limit").unwrap_or(0).max(0) as u64,
+            max_conns: int("max_conns").unwrap_or(500).clamp(10, 5000) as usize,
+            max_peers: int("max_peers").unwrap_or(80).clamp(5, 1000) as usize,
+            download_dir: cfg.download_dir.clone(),
+            ask_files: int("ask_files").unwrap_or(1) != 0,
+        };
+        if !cfg.persist {
+            settings.upnp = false;
+        }
+        let want_port = if cfg.port != 0 {
+            cfg.port
+        } else if settings.port != 0 {
+            settings.port
+        } else {
+            saved_port
+        };
+        let listener = bind_listener(want_port);
         let port = listener
             .as_ref()
             .and_then(|l| l.local_addr().ok())
             .map_or(0, |a| a.port());
 
-        let dht = if cfg.dht {
+        let dht = if cfg.dht && settings.dht {
             let id = saved
                 .as_ref()
                 .and_then(|s| s.get("dht_id"))
@@ -98,21 +149,17 @@ impl Session {
         } else {
             None
         };
-        let mut peer_id = *b"-RT0100-000000000000";
+        let mut peer_id = *b"-RT0200-000000000000";
         peer_id[8..].copy_from_slice(&rand_bytes::<12>());
-        let ctx = Arc::new(Ctx {
-            peer_id,
-            port,
-            dht,
-            conns: AtomicUsize::new(0),
-            max_conns: 400,
-        });
+        let ctx = Arc::new(Ctx::new(peer_id, port, dht));
         let download_dir = saved
             .as_ref()
             .and_then(|s| s.get("download_dir"))
             .and_then(Value::str)
             .map(PathBuf::from)
             .unwrap_or(cfg.download_dir);
+        settings.download_dir = download_dir.clone();
+        let portmap = (settings.upnp && port != 0).then(|| PortMapper::start(port));
         let s = Arc::new(Session {
             ctx,
             torrents: Arc::new(Mutex::new(Vec::new())),
@@ -121,10 +168,14 @@ impl Session {
             persist: cfg.persist,
             download_dir: Mutex::new(download_dir),
             save_lock: Mutex::new(()),
+            settings: Mutex::new(settings.clone()),
+            portmap: Mutex::new(portmap),
         });
+        s.apply_live(&settings);
         if let Some(l) = listener {
             let torrents = s.torrents.clone();
-            crate::util::spawn(move || accept_loop(l, torrents));
+            let ctx = s.ctx.clone();
+            crate::util::spawn(move || accept_loop(l, torrents, ctx));
         }
         if let Some(saved) = saved {
             s.restore(&saved);
@@ -138,6 +189,104 @@ impl Session {
 
     pub fn dht_nodes(&self) -> Option<usize> {
         self.ctx.dht.as_ref().map(|d| d.node_count())
+    }
+
+    pub fn settings(&self) -> Settings {
+        let mut s = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        s.download_dir = self.download_dir.lock().unwrap().clone();
+        s
+    }
+
+    /// Settings that apply immediately.
+    fn apply_live(&self, s: &Settings) {
+        self.ctx.down.set_rate(s.down_limit);
+        self.ctx.up.set_rate(s.up_limit);
+        self.ctx.max_conns.store(s.max_conns, Relaxed);
+        self.ctx.max_peers.store(s.max_peers, Relaxed);
+        self.ctx.encryption.store(s.encryption, Relaxed);
+    }
+
+    /// Apply new settings. Returns true if some of them need a restart.
+    pub fn apply_settings(&self, new: Settings) -> bool {
+        let old = self.settings();
+        self.apply_live(&new);
+        *self.download_dir.lock().unwrap() = new.download_dir.clone();
+        if new.upnp != old.upnp {
+            let mut pm = self.portmap.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(p) = pm.take() {
+                p.stop();
+            }
+            if new.upnp && self.ctx.port != 0 {
+                *pm = Some(PortMapper::start(self.ctx.port));
+            }
+        }
+        let restart = (new.port != old.port && new.port != 0 && new.port != self.ctx.port)
+            || new.dht != old.dht;
+        *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = new;
+        self.save();
+        restart
+    }
+
+    /// Port forwarding state for the status bar.
+    pub fn portmap_status(&self) -> Option<String> {
+        self.portmap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| p.status())
+    }
+
+    pub fn global_limits(&self) -> (u64, u64) {
+        (self.ctx.down.rate(), self.ctx.up.rate())
+    }
+
+    pub fn details(&self, id: u64) -> Option<Details> {
+        self.get(id).map(|t| t.details())
+    }
+
+    /// (download, upload) limit of a torrent in bytes/s; 0 = unlimited.
+    pub fn torrent_limits(&self, id: u64) -> Option<(u64, u64)> {
+        self.get(id)
+            .map(|t| (t.down_limit.rate(), t.up_limit.rate()))
+    }
+
+    pub fn set_torrent_limits(&self, id: u64, down: u64, up: u64) {
+        if let Some(t) = self.get(id) {
+            t.down_limit.set_rate(down);
+            t.up_limit.set_rate(up);
+            t.lock().dirty = true;
+        }
+    }
+
+    pub fn set_file_prio(&self, id: u64, files: &[usize], prio: u8) {
+        if let Some(t) = self.get(id) {
+            t.set_file_prio(files, prio);
+        }
+    }
+
+    pub fn add_trackers(&self, id: u64, urls: &[String]) {
+        if let Some(t) = self.get(id) {
+            t.add_trackers(urls);
+        }
+    }
+
+    pub fn remove_trackers(&self, id: u64, urls: &[String]) {
+        if let Some(t) = self.get(id) {
+            t.remove_trackers(urls);
+        }
+    }
+
+    pub fn reannounce(&self, id: u64) {
+        if let Some(t) = self.get(id) {
+            t.force_reannounce();
+            if let Some(d) = &self.ctx.dht {
+                d.search(t.info_hash, Arc::downgrade(&t));
+            }
+        }
     }
 
     fn list(&self) -> std::sync::MutexGuard<'_, Vec<Arc<Torrent>>> {
@@ -184,12 +333,26 @@ impl Session {
                     name,
                     trackers,
                 );
-                t.uploaded.store(
-                    e.get("uploaded").and_then(Value::int).unwrap_or(0).max(0) as u64,
-                    Relaxed,
-                );
+                let int = |k: &str| e.get(k).and_then(Value::int).unwrap_or(0).max(0) as u64;
+                t.uploaded.store(int("uploaded"), Relaxed);
+                t.down_limit.set_rate(int("down_limit"));
+                t.up_limit.set_rate(int("up_limit"));
+                let prio = e
+                    .get("file_prio")
+                    .and_then(Value::bytes)
+                    .map(|b| b.to_vec());
+                let mut restored_have = None;
                 {
                     let mut st = t.lock();
+                    if e.get("added_on").is_some() {
+                        st.added_on = int("added_on");
+                    }
+                    st.completed_on = int("completed_on");
+                    if st.meta.is_none() {
+                        st.pending_prio = prio;
+                    } else if let Some(p) = prio.filter(|p| p.len() == st.file_prio.len()) {
+                        st.file_prio = p;
+                    }
                     if let (Some(m), Some(storage)) = (st.meta.clone(), st.storage.clone()) {
                         let n = m.num_pieces();
                         let packed = e.get("have").and_then(Value::bytes).unwrap_or(&[]);
@@ -198,11 +361,7 @@ impl Session {
                                 .map(|i| packed[i / 8] & (0x80 >> (i % 8)) != 0)
                                 .collect();
                             if storage.files_present_for(&have) {
-                                st.have_seq = (0..n as u32).filter(|&i| have[i as usize]).collect();
-                                st.have_count = st.have_seq.len();
-                                st.have_bytes =
-                                    st.have_seq.iter().map(|&i| m.piece_len(i as usize)).sum();
-                                st.have = have;
+                                restored_have = Some(have);
                             } else {
                                 st.needs_check = true;
                             }
@@ -210,6 +369,11 @@ impl Session {
                             st.needs_check = storage.any_file_exists();
                         }
                     }
+                }
+                match restored_have {
+                    Some(have) => t.set_have(have),
+                    // Recompute wanted counters for the restored file priorities.
+                    None => t.set_have(t.lock().have.clone()),
                 }
                 let paused = e.get("paused").and_then(Value::int).unwrap_or(0) != 0;
                 self.list().push(t.clone());
@@ -230,6 +394,15 @@ impl Session {
     }
 
     pub fn add_torrent_bytes(&self, data: &[u8]) -> Result<u64> {
+        self.add_torrent_with(data, AddOptions::default())
+    }
+
+    /// True if a torrent with this info hash is already in the list.
+    pub fn contains(&self, info_hash: &[u8; 20]) -> bool {
+        self.list().iter().any(|t| &t.info_hash == info_hash)
+    }
+
+    pub fn add_torrent_with(&self, data: &[u8], opts: AddOptions) -> Result<u64> {
         let (meta, trackers) = Metainfo::from_torrent(data)?;
         if let Some(t) = self.list().iter().find(|t| t.info_hash == meta.info_hash) {
             t.add_trackers(&trackers);
@@ -239,7 +412,9 @@ impl Session {
             let _ = fs::write(self.info_path(&meta.info_hash), &meta.info_bytes);
         }
         let id = self.next_id.fetch_add(1, SeqCst);
-        let dir = self.download_dir.lock().unwrap().clone();
+        let dir = opts
+            .save_dir
+            .unwrap_or_else(|| self.download_dir.lock().unwrap().clone());
         let ih = meta.info_hash;
         let name = meta.name.clone();
         let t = Torrent::new(
@@ -251,12 +426,23 @@ impl Session {
             name,
             trackers,
         );
+        if let Some(p) = opts.file_prio {
+            let files: Vec<usize> = (0..p.len()).collect();
+            for prio in [0, 1, 2] {
+                let sel: Vec<usize> = files.iter().copied().filter(|&i| p[i] == prio).collect();
+                if !sel.is_empty() {
+                    t.set_file_prio(&sel, prio);
+                }
+            }
+        }
         {
             let mut st = t.lock();
             st.needs_check = st.storage.as_ref().is_some_and(|s| s.any_file_exists());
         }
         self.list().push(t.clone());
-        t.start();
+        if !opts.paused {
+            t.start();
+        }
         self.save();
         Ok(id)
     }
@@ -385,6 +571,17 @@ impl Session {
                         pack_bits(&st.have)
                     }),
                 ),
+                ("added_on", Value::Int(st.added_on as i64)),
+                ("completed_on", Value::Int(st.completed_on as i64)),
+                ("down_limit", Value::Int(t.down_limit.rate() as i64)),
+                (
+                    "file_prio",
+                    Value::Bytes(
+                        st.pending_prio
+                            .clone()
+                            .unwrap_or_else(|| st.file_prio.clone()),
+                    ),
+                ),
                 ("info_hash", Value::b(&t.info_hash)),
                 ("name", Value::s(&st.name)),
                 ("paused", Value::Int(t.is_paused() as i64)),
@@ -393,6 +590,7 @@ impl Session {
                     "trackers",
                     Value::List(st.trackers.iter().map(|s| Value::s(s)).collect()),
                 ),
+                ("up_limit", Value::Int(t.up_limit.rate() as i64)),
                 ("uploaded", Value::Int(t.uploaded.load(Relaxed) as i64)),
             ]));
             // Write metadata fetched from a magnet link once.
@@ -403,13 +601,23 @@ impl Session {
                 }
             }
         }
+        let cfg = self.settings();
         let mut top = vec![
+            ("ask_files", Value::Int(cfg.ask_files as i64)),
+            ("dht", Value::Int(cfg.dht as i64)),
+            ("down_limit", Value::Int(cfg.down_limit as i64)),
             (
                 "download_dir",
-                Value::s(&self.download_dir.lock().unwrap().to_string_lossy()),
+                Value::s(&cfg.download_dir.to_string_lossy()),
             ),
+            ("encryption", Value::Int(cfg.encryption as i64)),
+            ("listen_port", Value::Int(cfg.port as i64)),
+            ("max_conns", Value::Int(cfg.max_conns as i64)),
+            ("max_peers", Value::Int(cfg.max_peers as i64)),
             ("port", Value::Int(self.ctx.port as i64)),
             ("torrents", Value::List(entries)),
+            ("up_limit", Value::Int(cfg.up_limit as i64)),
+            ("upnp", Value::Int(cfg.upnp as i64)),
         ];
         if let Some(d) = &self.ctx.dht {
             top.push(("dht_id", Value::b(&d.id())));
@@ -434,33 +642,44 @@ impl Session {
         for t in self.list().iter() {
             t.pause();
         }
+        if let Some(p) = self
+            .portmap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            p.stop();
+        }
     }
 }
 
-fn accept_loop(l: TcpListener, torrents: Arc<Mutex<Vec<Arc<Torrent>>>>) {
+fn accept_loop(l: TcpListener, torrents: Arc<Mutex<Vec<Arc<Torrent>>>>, ctx: Arc<Ctx>) {
     for stream in l.incoming() {
-        let Ok(mut s) = stream else {
+        let Ok(s) = stream else {
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
         let torrents = torrents.clone();
+        let ctx = ctx.clone();
         crate::util::spawn(move || {
-            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-            let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
-            let Ok(addr) = s.peer_addr() else { return };
-            let Ok(hs) = conn::read_handshake(&mut s) else {
-                return;
-            };
-            let t = torrents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .find(|t| t.matches_hash(&hs.info_hash))
-                .cloned();
-            if let Some(t) = t {
-                if !t.is_paused() {
-                    conn::incoming(t, s, addr, hs);
-                }
+            let list = || torrents.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let r = conn::accept(
+                s,
+                &ctx,
+                |ih| list().into_iter().find(|t| t.matches_hash(ih)),
+                || {
+                    let mut out = Vec::new();
+                    for t in list() {
+                        out.push(t.info_hash);
+                        if let Some(v2) = t.meta().and_then(|m| m.info_hash_v2) {
+                            out.push(v2);
+                        }
+                    }
+                    out
+                },
+            );
+            if std::env::var_os("RT_DEBUG").is_some() {
+                eprintln!("incoming ended: {:?}", r.err());
             }
         });
     }

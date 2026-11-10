@@ -214,9 +214,10 @@ impl Storage {
     }
 
     /// Create zero-length files so the layout is complete once downloading finishes.
-    pub fn create_empty_files(&self) {
+    /// Files with priority 0 (skipped) are left out.
+    pub fn create_empty_files(&self, prio: &[u8]) {
         for (i, fe) in self.files.iter().enumerate() {
-            if fe.length == 0 && !fe.pad {
+            if fe.length == 0 && !fe.pad && prio.get(i).copied().unwrap_or(1) > 0 {
                 let _ = self.handle(i, true);
             }
         }
@@ -291,7 +292,7 @@ mod tests {
         s.write(0, 0, b"abcd").unwrap();
         s.write(1, 0, b"efgh").unwrap();
         s.write(2, 0, b"i").unwrap();
-        s.create_empty_files();
+        s.create_empty_files(&[]);
         let mut b = [0u8; 4];
         s.read(0, 2, &mut b).unwrap();
         assert_eq!(&b, b"cdef");

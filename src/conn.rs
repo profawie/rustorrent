@@ -1,11 +1,19 @@
-//! Peer wire protocol (BEP 3), extension protocol (BEP 10), ut_metadata (BEP 9) and ut_pex (BEP 11).
+//! Peer wire protocol (BEP 3), extension protocol (BEP 10), ut_metadata (BEP 9) and ut_pex (BEP 11),
+//! optionally wrapped in MSE/PE encryption.
 
 use crate::bail;
 use crate::bencode::{self, Value, dict};
-use crate::torrent::{BLOCK, Block, Status, Torrent};
+use crate::limit;
+use crate::mse::{
+    self, CRYPTO_PLAIN, CRYPTO_RC4, ENC_DISABLE, ENC_REQUIRE, PeerReader, PeerWriter,
+};
+use crate::torrent::{
+    BLOCK, Block, Ctx, PF_CHOKED, PF_INTERESTED, PF_PEER_INTERESTED, PF_UNCHOKED_PEER, PeerLive,
+    Status, Torrent,
+};
 use crate::tracker::{parse_compact_v4, parse_compact_v6};
 use crate::util::Result;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -35,9 +43,7 @@ pub fn handshake_bytes(info_hash: &[u8; 20], peer_id: &[u8; 20], dht: bool) -> [
     h
 }
 
-pub fn read_handshake(s: &mut TcpStream) -> Result<Handshake> {
-    let mut h = [0u8; 68];
-    s.read_exact(&mut h)?;
+fn parse_handshake(h: &[u8; 68]) -> Result<Handshake> {
     if &h[..20] != PSTR {
         bail!("not a BitTorrent handshake");
     }
@@ -48,63 +54,191 @@ pub fn read_handshake(s: &mut TcpStream) -> Result<Handshake> {
     })
 }
 
-/// Make an outgoing connection and run it until it ends.
+pub fn read_handshake(s: &mut impl Read) -> Result<Handshake> {
+    let mut h = [0u8; 68];
+    s.read_exact(&mut h)?;
+    parse_handshake(&h)
+}
+
+/// Client name from an Azureus-style peer id such as `-qB4630-`.
+fn client_from_peer_id(id: &[u8; 20]) -> String {
+    if id[0] != b'-' || id[7] != b'-' || !id[1..7].iter().all(|c| c.is_ascii_alphanumeric()) {
+        return String::new();
+    }
+    let code = std::str::from_utf8(&id[1..3]).unwrap_or("");
+    let name = match code {
+        "qB" => "qBittorrent",
+        "TR" => "Transmission",
+        "DE" => "Deluge",
+        "UT" => "\u{b5}Torrent",
+        "UM" => "\u{b5}Torrent Mac",
+        "BT" => "BitTorrent",
+        "LT" | "lt" => "libtorrent",
+        "AZ" => "Vuze",
+        "BI" => "BiglyBT",
+        "RT" => "rustorrent",
+        "KT" => "KTorrent",
+        "FD" => "Free Download Manager",
+        "AG" | "A~" => "Ares",
+        "WW" => "WebTorrent",
+        _ => code,
+    };
+    let v: Vec<String> = id[3..7].iter().map(|&c| (c as char).to_string()).collect();
+    format!("{} {}", name, v.join("."))
+}
+
+/// Make an outgoing connection and run it until it ends. With encryption preferred, a
+/// peer that does not understand MSE is retried in plaintext.
 pub fn outgoing(t: Arc<Torrent>, addr: SocketAddr, epoch: u64) {
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(7));
-    t.half_open_done();
+    let mode = t.ctx.encryption.load(Relaxed);
+    let attempts: &[bool] = match mode {
+        ENC_REQUIRE => &[true],
+        ENC_DISABLE => &[false],
+        _ => &[true, false],
+    };
     let mut handshaked = false;
-    if let Ok(mut s) = stream {
+    for (n, &encrypt) in attempts.iter().enumerate() {
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(7));
+        if n == 0 {
+            t.half_open_done();
+        }
+        let Ok(s) = stream else { break };
+        let mut fallback = false;
         let r = (|| -> Result<()> {
             s.set_read_timeout(Some(Duration::from_secs(15)))?;
             s.set_write_timeout(Some(Duration::from_secs(15)))?;
-            s.write_all(&handshake_bytes(
-                &t.info_hash,
-                &t.ctx.peer_id,
-                t.ctx.dht.is_some(),
-            ))?;
-            let hs = read_handshake(&mut s)?;
-            if !t.matches_hash(&hs.info_hash) || hs.peer_id == t.ctx.peer_id {
+            let hs = handshake_bytes(&t.info_hash, &t.ctx.peer_id, t.ctx.dht.is_some());
+            let (mut r, w) = if encrypt {
+                let provide = if mode == ENC_REQUIRE {
+                    CRYPTO_RC4
+                } else {
+                    CRYPTO_RC4 | CRYPTO_PLAIN
+                };
+                match mse::initiate(&s, &t.info_hash, &hs, provide) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        fallback = e.fallback;
+                        return Err(e.err);
+                    }
+                }
+            } else {
+                let (r, mut w) = mse::plain(&s)?;
+                w.write_all(&hs)?;
+                (r, w)
+            };
+            let peer = read_handshake(&mut r)?;
+            if !t.matches_hash(&peer.info_hash) || peer.peer_id == t.ctx.peer_id {
                 bail!("handshake mismatch");
             }
             handshaked = true;
-            run_registered(t.clone(), s, addr, epoch, hs)
+            run_registered(t.clone(), s.try_clone()?, r, w, addr, epoch, peer, false)
         })();
         if std::env::var_os("RT_DEBUG").is_some() {
-            eprintln!("outgoing {} ended: {:?}", addr, r.err());
+            eprintln!(
+                "outgoing {} (enc {}) ended: {:?}",
+                addr,
+                encrypt,
+                r.as_ref().err()
+            );
+        }
+        let _ = s.shutdown(Shutdown::Both);
+        if handshaked || !fallback || !t.active(epoch) {
+            break;
         }
     }
     t.peer_done(addr, handshaked);
 }
 
-/// Continue an accepted connection whose handshake has already been read.
-pub fn incoming(t: Arc<Torrent>, mut s: TcpStream, addr: SocketAddr, hs: Handshake) {
-    let Some(epoch) = t.current_gen() else { return };
-    if hs.peer_id == t.ctx.peer_id {
-        return;
+/// Handle an accepted connection: plaintext or encrypted handshake, then the peer protocol.
+/// `find` maps an info hash (v1 or truncated v2) to its torrent.
+pub fn accept(
+    s: TcpStream,
+    ctx: &Ctx,
+    find: impl Fn(&[u8; 20]) -> Option<Arc<Torrent>>,
+    all_hashes: impl Fn() -> Vec<[u8; 20]>,
+) -> Result<()> {
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    s.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let addr = s.peer_addr()?;
+    let mode = ctx.encryption.load(Relaxed);
+    let mut first = [0u8; 20];
+    (&s).read_exact(&mut first)?;
+    let (r, w, hs) = if &first == PSTR {
+        if mode == ENC_REQUIRE {
+            bail!("plaintext connection refused");
+        }
+        let mut h = [0u8; 68];
+        h[..20].copy_from_slice(&first);
+        (&s).read_exact(&mut h[20..])?;
+        let (r, w) = mse::plain(&s)?;
+        (r, w, parse_handshake(&h)?)
+    } else {
+        if mode == ENC_DISABLE {
+            bail!("encrypted connection refused");
+        }
+        let allow = if mode == ENC_REQUIRE {
+            CRYPTO_RC4
+        } else {
+            CRYPTO_RC4 | CRYPTO_PLAIN
+        };
+        let (mut r, w, skey) = mse::respond(&s, &first, &all_hashes(), allow)?;
+        let hs = read_handshake(&mut r)?;
+        if hs.info_hash != skey {
+            bail!("handshake does not match encryption key");
+        }
+        (r, w, hs)
+    };
+    let t = find(&hs.info_hash).ok_or("unknown torrent")?;
+    if t.is_paused() {
+        bail!("torrent paused");
     }
-    let _ = (|| -> Result<()> {
-        // Reply with the hash the peer used (v1, or truncated v2 for hybrid torrents).
-        s.write_all(&handshake_bytes(
-            &hs.info_hash,
-            &t.ctx.peer_id,
-            t.ctx.dht.is_some(),
-        ))?;
-        run_registered(t.clone(), s, addr, epoch, hs)
-    })();
+    incoming(t, s, r, w, addr, hs)
 }
 
+/// Continue an accepted connection whose handshake has already been read.
+fn incoming(
+    t: Arc<Torrent>,
+    s: TcpStream,
+    r: PeerReader,
+    mut w: PeerWriter,
+    addr: SocketAddr,
+    hs: Handshake,
+) -> Result<()> {
+    let Some(epoch) = t.current_gen() else {
+        return Ok(());
+    };
+    if hs.peer_id == t.ctx.peer_id {
+        return Ok(());
+    }
+    // Reply with the hash the peer used (v1, or truncated v2 for hybrid torrents).
+    w.write_all(&handshake_bytes(
+        &hs.info_hash,
+        &t.ctx.peer_id,
+        t.ctx.dht.is_some(),
+    ))?;
+    run_registered(t.clone(), s, r, w, addr, epoch, hs, true)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_registered(
     t: Arc<Torrent>,
     s: TcpStream,
+    reader: PeerReader,
+    w: PeerWriter,
     addr: SocketAddr,
     epoch: u64,
     hs: Handshake,
+    incoming: bool,
 ) -> Result<()> {
-    let id = t.register(addr).ok_or("duplicate connection")?;
+    let live = t
+        .register(addr, incoming, w.level())
+        .ok_or("duplicate connection")?;
+    if let Ok(mut c) = live.client.lock() {
+        *c = client_from_peer_id(&hs.peer_id);
+    }
     s.set_nodelay(true)?;
     s.set_read_timeout(None)?;
     s.set_write_timeout(Some(Duration::from_secs(60)))?;
-    let reader = s.try_clone()?;
     let (tx, rx) = sync_channel::<Vec<u8>>(128);
     // Reader thread: blocking reads, frames handed over a bounded channel.
     crate::util::spawn(move || {
@@ -124,7 +258,8 @@ fn run_registered(
             }
         }
     });
-    let mut c = Conn::new(t.clone(), s, addr, epoch, hs.ext);
+    let id = live.id;
+    let mut c = Conn::new(t.clone(), s, w, live, addr, epoch, hs.ext);
     let res = c.run(rx);
     if std::env::var_os("RT_DEBUG").is_some() {
         eprintln!("peer {} closed: {:?}", addr, res.as_ref().err());
@@ -137,6 +272,9 @@ fn run_registered(
 struct Conn {
     t: Arc<Torrent>,
     s: TcpStream,
+    w: PeerWriter,
+    live: Arc<PeerLive>,
+    throttled: bool,
     addr: SocketAddr,
     epoch: u64,
     wbuf: Vec<u8>,
@@ -166,11 +304,22 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(t: Arc<Torrent>, s: TcpStream, addr: SocketAddr, epoch: u64, peer_ext: bool) -> Conn {
+    fn new(
+        t: Arc<Torrent>,
+        s: TcpStream,
+        w: PeerWriter,
+        live: Arc<PeerLive>,
+        addr: SocketAddr,
+        epoch: u64,
+        peer_ext: bool,
+    ) -> Conn {
         let now = Instant::now();
         Conn {
             t,
             s,
+            w,
+            live,
+            throttled: false,
             addr,
             epoch,
             wbuf: Vec::with_capacity(64 * 1024),
@@ -224,7 +373,7 @@ impl Conn {
 
     fn flush(&mut self) -> Result<()> {
         if !self.wbuf.is_empty() {
-            self.s.write_all(&self.wbuf)?;
+            self.w.write_all(&self.wbuf)?;
             self.wbuf.clear();
             self.last_send = Instant::now();
         }
@@ -271,7 +420,11 @@ impl Conn {
                 return Ok(());
             }
             let busy = !self.am_choking && !self.requests.is_empty();
-            let wait = Duration::from_millis(if busy { 0 } else { 250 });
+            let wait = Duration::from_millis(match (busy, self.throttled) {
+                (_, true) => 50,
+                (true, false) => 0,
+                (false, false) => 250,
+            });
             match rx.recv_timeout(wait) {
                 Ok(frame) => {
                     self.last_recv = Instant::now();
@@ -401,6 +554,7 @@ impl Conn {
                 }
                 self.last_block = Instant::now();
                 self.t.downloaded.fetch_add(data.len() as u64, Relaxed);
+                self.live.down.fetch_add(data.len() as u64, Relaxed);
                 self.t.on_block(index, begin, data)?;
             }
             8 => {
@@ -439,6 +593,11 @@ impl Conn {
                         .and_then(Value::int)
                         .filter(|&i| i > 0 && i < 256)
                         .map(|i| i as u8);
+                }
+                if let Some(name) = v.get("v").and_then(Value::str) {
+                    if let Ok(mut c) = self.live.client.lock() {
+                        *c = name.chars().filter(|c| !c.is_control()).take(48).collect();
+                    }
                 }
                 if let Some(q) = v.get("reqq").and_then(Value::int) {
                     self.max_outstanding = q.clamp(8, 250) as usize;
@@ -516,6 +675,7 @@ impl Conn {
 
     fn tick(&mut self) -> Result<()> {
         let now = Instant::now();
+        self.throttled = false;
         if self.num_pieces == 0 {
             if self.t.meta().is_some() {
                 self.on_meta()?;
@@ -559,19 +719,38 @@ impl Conn {
                     self.msg(3, &[]);
                 }
             }
-            // Requests.
+            // Requests. With a download limit, only request what the budget allows.
+            let t = self.t.clone();
+            let limits = [&t.ctx.down, &t.down_limit];
+            let limit_rate = limits.iter().map(|l| l.rate()).filter(|&r| r > 0).min();
+            let max_out = match limit_rate {
+                Some(r) => self
+                    .max_outstanding
+                    .min((r / BLOCK as u64).clamp(2, 64) as usize),
+                None => self.max_outstanding,
+            };
             if self.am_interested
                 && !self.peer_choking
-                && self.outstanding.len() < self.max_outstanding / 2 + 1
+                && self.outstanding.len() < max_out / 2 + 1
+                && (limit_rate.is_none() || limit::take(&limits, 0))
             {
                 if self.outstanding.is_empty() {
                     self.last_block = now;
                 }
                 let mut o = std::mem::take(&mut self.outstanding);
-                let new = self.t.pick_blocks(&self.bits, &mut o, self.max_outstanding);
+                let new = self.t.pick_blocks(&self.bits, &mut o, max_out);
                 self.outstanding = o;
+                let mut unsent = Vec::new();
                 for (i, b, l) in new {
-                    self.msg_u32s(6, &[i, b, l]);
+                    if limit_rate.is_none() || limit::take(&limits, l as u64) {
+                        self.msg_u32s(6, &[i, b, l]);
+                    } else {
+                        unsent.push((i, b, l));
+                    }
+                }
+                if !unsent.is_empty() {
+                    self.outstanding.retain(|b| !unsent.contains(b));
+                    self.t.release(&unsent);
                 }
             }
             // Uploads.
@@ -582,6 +761,11 @@ impl Conn {
                 let Some((i, b, l)) = self.requests.pop_front() else {
                     break;
                 };
+                if !limit::take(&[&t.ctx.up, &t.up_limit], l as u64) {
+                    self.requests.push_front((i, b, l));
+                    self.throttled = true;
+                    break;
+                }
                 if let Some(data) = self.t.read_block(i, b, l) {
                     let mut p = Vec::with_capacity(8 + data.len());
                     p.extend_from_slice(&i.to_be_bytes());
@@ -589,16 +773,17 @@ impl Conn {
                     p.extend_from_slice(&data);
                     self.msg(7, &p);
                     self.t.uploaded.fetch_add(l as u64, Relaxed);
+                    self.live.up.fetch_add(l as u64, Relaxed);
                     if self.wbuf.len() > 256 * 1024 {
                         break;
                     }
                 }
             }
-            // Both sides complete: nothing to exchange.
-            let we_complete = self.t.is_complete();
-            if we_complete && self.peer_have_count == self.num_pieces {
+            // We have everything we want and the peer needs nothing from us.
+            if self.peer_have_count == self.num_pieces && self.t.is_finished() {
                 bail!("both seeds");
             }
+            self.live.have.store(self.peer_have_count, Relaxed);
         }
         // Peer stopped sending blocks we asked for.
         if !self.outstanding.is_empty() && now - self.last_block > Duration::from_secs(60) {
@@ -610,6 +795,18 @@ impl Conn {
         if now - self.last_send > Duration::from_secs(90) {
             self.wbuf.extend_from_slice(&[0, 0, 0, 0]);
         }
+        let mut flags = 0;
+        for (on, bit) in [
+            (self.am_interested, PF_INTERESTED),
+            (self.peer_choking, PF_CHOKED),
+            (self.peer_interested, PF_PEER_INTERESTED),
+            (!self.am_choking, PF_UNCHOKED_PEER),
+        ] {
+            if on {
+                flags |= bit;
+            }
+        }
+        self.live.flags.store(flags, Relaxed);
         let status = self.t.lock().status.clone();
         if matches!(status, Status::Error(_) | Status::Paused) {
             bail!("torrent stopped");
