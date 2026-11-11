@@ -3,8 +3,8 @@
 1 24 "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 0,2,0,0
-PRODUCTVERSION 0,2,0,0
+FILEVERSION 0,2,1,0
+PRODUCTVERSION 0,2,1,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -14,8 +14,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "rustorrent BitTorrent client"
       VALUE "ProductName", "rustorrent"
-      VALUE "FileVersion", "0.2.0"
-      VALUE "ProductVersion", "0.2.0"
+      VALUE "FileVersion", "0.2.1"
+      VALUE "ProductVersion", "0.2.1"
       VALUE "OriginalFilename", "rustorrent.exe"
     END
   END

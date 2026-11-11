@@ -18,6 +18,7 @@ use windows_sys::Win32::System::Com::*;
 use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::*;
+use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::Controls::Dialogs::*;
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -158,18 +159,16 @@ fn make_row(s: &Stats) -> Row {
 
 pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    install_panic_hook();
+    crate::log(&format!(
+        "starting rustorrent {} (data folder: {})",
+        env!("CARGO_PKG_VERSION"),
+        crate::data_dir().display()
+    ));
     unsafe {
         let class = w(MAIN_CLASS);
         // Single instance: hand arguments to the running window and leave.
-        let existing = FindWindowW(class.as_ptr(), null());
-        if !existing.is_null() {
-            for a in &args {
-                send_copydata(existing, a);
-            }
-            if IsIconic(existing) != 0 {
-                ShowWindow(existing, SW_RESTORE);
-            }
-            SetForegroundWindow(existing);
+        if hand_over_to_running(&class, &args) {
             return;
         }
         CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
@@ -190,7 +189,12 @@ pub fn run() {
         wc.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
         wc.hbrBackground = (COLOR_BTNFACE + 1) as usize as HBRUSH;
         wc.lpszClassName = class.as_ptr();
-        RegisterClassExW(&wc);
+        if RegisterClassExW(&wc) == 0 {
+            crate::log(&format!(
+                "RegisterClassExW failed: error {}",
+                GetLastError()
+            ));
+        }
         let dlg_class = w(dialogs::DLG_CLASS);
         wc.lpfnWndProc = Some(dialogs::dlg_proc);
         wc.lpszClassName = dlg_class.as_ptr();
@@ -201,19 +205,11 @@ pub fn run() {
         wc.hbrBackground = null_mut();
         RegisterClassExW(&wc);
 
-        let session = Session::new(Config {
-            data_dir: crate::data_dir(),
-            port: 0,
-            dht: true,
-            persist: true,
-            download_dir: crate::default_download_dir(),
-        });
-
         let hdc = GetDC(null_mut());
         let dpi = GetDeviceCaps(hdc, LOGPIXELSY as _).max(96);
         ReleaseDC(null_mut(), hdc);
 
-        let title = w("rustorrent");
+        let title = w("rustorrent (starting\u{2026})");
         let hwnd = CreateWindowExW(
             WS_EX_ACCEPTFILES,
             class.as_ptr(),
@@ -229,18 +225,36 @@ pub fn run() {
             null(),
         );
         if hwnd.is_null() {
+            let err = GetLastError();
+            crate::log(&format!("CreateWindowExW failed: error {}", err));
+            message(
+                null_mut(),
+                &format!("rustorrent could not create its window (error {}).", err),
+                MB_OK | MB_ICONERROR,
+            );
             return;
         }
+        // Show the window before starting the engine, so slow disks or networks
+        // (port forwarding, DHT, resuming torrents) can never keep it hidden.
+        keep_on_screen(hwnd);
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        UpdateWindow(hwnd);
+        SetForegroundWindow(hwnd);
+        crate::log("window shown");
+
+        let Some(session) = start_session(hwnd) else {
+            crate::log("closed before the engine finished starting");
+            return;
+        };
         create_children(hwnd, hinst, session, dpi);
         layout(hwnd);
         DragAcceptFiles(hwnd, 1);
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
         SetTimer(hwnd, TIMER_ID, 1000, None);
         for a in &args {
             add_item(hwnd, a);
         }
         tick(hwnd);
+        crate::log("ready");
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -262,6 +276,163 @@ pub fn run() {
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        crate::log("exiting");
+    }
+}
+
+/// Log panics and tell the user, instead of vanishing silently (there is no console).
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let text = format!("panic: {}", info);
+        crate::log(&text);
+        unsafe {
+            message(
+                null_mut(),
+                &format!(
+                    "rustorrent hit an internal error and has to close.\n\n{}\n\nDetails were saved to {}",
+                    text,
+                    crate::data_dir().join("rustorrent.log").display()
+                ),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }));
+}
+
+/// If rustorrent is already running, pass it our arguments and bring it forward.
+/// Returns true when this process should exit.
+unsafe fn hand_over_to_running(class: &[u16], args: &[String]) -> bool {
+    unsafe {
+        let existing = FindWindowW(class.as_ptr(), null());
+        if existing.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(existing, &mut pid);
+        let mut res = 0usize;
+        let responding =
+            SendMessageTimeoutW(existing, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 3000, &mut res) != 0;
+        if responding {
+            crate::log(&format!("already running as process {}; handing over", pid));
+            for a in args {
+                send_copydata(existing, a);
+            }
+            if IsWindowVisible(existing) == 0 {
+                ShowWindow(existing, SW_SHOW);
+            }
+            if IsIconic(existing) != 0 {
+                ShowWindow(existing, SW_RESTORE);
+            }
+            SetForegroundWindow(existing);
+            return true;
+        }
+        // An earlier copy is stuck. Exiting quietly here would look like
+        // "nothing happens" to the user, so ask what to do instead.
+        crate::log(&format!(
+            "process {} has a window but is not responding",
+            pid
+        ));
+        let text = format!(
+            "Another copy of rustorrent (process {}) is running but not responding.\n\nEnd it and start a new one?",
+            pid
+        );
+        if message(null_mut(), &text, MB_YESNO | MB_ICONWARNING) != IDYES {
+            return true;
+        }
+        let h = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+        if h.is_null() || TerminateProcess(h, 1) == 0 {
+            if !h.is_null() {
+                CloseHandle(h);
+            }
+            message(
+                null_mut(),
+                &format!(
+                    "Could not end process {}. Please end rustorrent.exe in Task Manager and try again.",
+                    pid
+                ),
+                MB_OK | MB_ICONERROR,
+            );
+            return true;
+        }
+        WaitForSingleObject(h, 5000);
+        CloseHandle(h);
+        crate::log(&format!("ended stuck process {}", pid));
+        false
+    }
+}
+
+/// Move the window onto the primary work area if it is not on any monitor.
+unsafe fn keep_on_screen(hwnd: HWND) {
+    unsafe {
+        if !MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL).is_null() {
+            return;
+        }
+        let mut wa: RECT = std::mem::zeroed();
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as *mut c_void, 0);
+        let mut rc: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut rc);
+        let width = (rc.right - rc.left).min(wa.right - wa.left);
+        let height = (rc.bottom - rc.top).min(wa.bottom - wa.top);
+        crate::log("window was off-screen; moving it to the primary monitor");
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            wa.left + (wa.right - wa.left - width) / 2,
+            wa.top + (wa.bottom - wa.top - height) / 2,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Start the engine on a worker thread while the (already visible) window keeps
+/// handling messages. Returns None if the user closed the window meanwhile.
+unsafe fn start_session(hwnd: HWND) -> Option<Arc<Session>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let s = Session::new(Config {
+            data_dir: crate::data_dir(),
+            port: 0,
+            dht: true,
+            persist: true,
+            download_dir: crate::default_download_dir(),
+        });
+        let _ = tx.send(s);
+    });
+    let started = std::time::Instant::now();
+    let mut warned = false;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+            Ok(s) => {
+                crate::log(&format!(
+                    "engine started in {} ms (port {})",
+                    started.elapsed().as_millis(),
+                    s.port()
+                ));
+                return Some(s);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The panic hook has already logged and reported it.
+                unsafe { DestroyWindow(hwnd) };
+                return None;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if !warned && started.elapsed() > std::time::Duration::from_secs(10) {
+            warned = true;
+            crate::log("engine is taking more than 10 s to start");
+        }
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if msg.message == WM_QUIT {
+                    return None;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
 }
@@ -1248,6 +1419,7 @@ unsafe extern "system" fn main_proc(
                 1
             }
             WM_CLOSE => {
+                crate::log("closing");
                 KillTimer(hwnd, TIMER_ID);
                 if let Some(s) = with_app(|a| a.session.clone()) {
                     s.shutdown();

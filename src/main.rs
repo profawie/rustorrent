@@ -27,6 +27,11 @@ use std::path::PathBuf;
 
 /// Portable data folder: next to the executable if writable, else the user's app-data folder.
 pub fn data_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(find_data_dir).clone()
+}
+
+fn find_data_dir() -> PathBuf {
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("rustorrent_data")))
@@ -44,6 +49,34 @@ pub fn data_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| ".".into());
     base.join("rustorrent")
+}
+
+/// Append a timestamped line to `rustorrent.log` in the data folder.
+/// The GUI build has no console, so this is the only trace of startup problems.
+pub fn log(msg: &str) {
+    use std::io::Write;
+    let path = data_dir().join("rustorrent.log");
+    // Keep the log small: start over once it passes 256 KB.
+    let append = std::fs::metadata(&path).is_ok_and(|m| m.len() < 256 * 1024);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(&path);
+    if let Ok(mut f) = file {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let _ = writeln!(
+            f,
+            "[{}.{:03}] pid {} {}",
+            secs / 1000,
+            secs % 1000,
+            std::process::id(),
+            msg
+        );
+    }
 }
 
 pub fn default_download_dir() -> PathBuf {

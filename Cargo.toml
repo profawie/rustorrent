@@ -1,6 +1,6 @@
 [package]
 name = "rustorrent"
-version = "0.2.0"
+version = "0.2.1"
 description = "Small, fast, portable BitTorrent client for Windows"
 edition = "2024"
 
@@ -19,6 +19,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Threading",
     "Win32_System_Time",
     "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
