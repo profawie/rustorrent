@@ -6,8 +6,11 @@
 mod bencode;
 mod conn;
 mod dht;
+mod limit;
 mod magnet;
 mod metainfo;
+mod mse;
+mod portmap;
 mod session;
 mod storage;
 mod torrent;
@@ -70,6 +73,7 @@ fn main() {
     let mut items = Vec::new();
     let mut peers = Vec::new();
     let mut exit_on_complete = false;
+    let mut enc = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--port" => cfg.port = args.next().and_then(|p| p.parse().ok()).unwrap_or(0),
@@ -80,6 +84,13 @@ fn main() {
                     .and_then(|p| p.parse::<std::net::SocketAddr>().ok()),
             ),
             "--exit-on-complete" => exit_on_complete = true,
+            "--enc" => {
+                enc = match args.next().as_deref() {
+                    Some("require") => Some(mse::ENC_REQUIRE),
+                    Some("disable") => Some(mse::ENC_DISABLE),
+                    _ => Some(mse::ENC_PREFER),
+                }
+            }
             "--make" => {
                 let path = PathBuf::from(args.next().expect("--make <file>"));
                 let data = metainfo::create_single(&path, 256 * 1024, None).expect("create");
@@ -92,6 +103,11 @@ fn main() {
         }
     }
     let s = Session::new(cfg);
+    if let Some(e) = enc {
+        let mut st = s.settings();
+        st.encryption = e;
+        s.apply_settings(st);
+    }
     let mut ids = Vec::new();
     for it in items {
         let r = if it.starts_with("magnet:") {

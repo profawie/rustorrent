@@ -1,9 +1,13 @@
 //! Native Win32 user interface (no GUI framework: keeps the executable small).
 
+mod details;
+mod dialogs;
+
+use crate::metainfo::Metainfo;
 use crate::session::{Config, Session};
 use crate::torrent::{Stats, Status};
 use crate::util::{fmt_bytes, fmt_eta, fmt_rate};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
@@ -21,12 +25,10 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const MAIN_CLASS: &str = "RustorrentMainWindow";
-const INPUT_CLASS: &str = "RustorrentInputWindow";
 const CF_UNICODETEXT: u32 = 13;
 
 const IDC_LIST: usize = 100;
 const IDC_STATUS: usize = 101;
-const IDC_INPUT_EDIT: usize = 102;
 
 const ID_ADD: usize = 201;
 const ID_MAGNET: usize = 202;
@@ -34,10 +36,12 @@ const ID_START: usize = 203;
 const ID_PAUSE: usize = 204;
 const ID_REMOVE: usize = 205;
 const ID_OPEN: usize = 206;
-const ID_SETDIR: usize = 207;
+const ID_SETTINGS: usize = 207;
 const ID_REMOVE_DELETE: usize = 208;
 const ID_COPY_MAGNET: usize = 209;
 const ID_RECHECK: usize = 210;
+const ID_LIMIT: usize = 211;
+const ID_REANNOUNCE: usize = 212;
 const TIMER_ID: usize = 1;
 
 const BUTTONS: [(&str, usize, i32); 7] = [
@@ -47,8 +51,10 @@ const BUTTONS: [(&str, usize, i32); 7] = [
     ("Pause", ID_PAUSE, 64),
     ("Remove", ID_REMOVE, 72),
     ("Open folder", ID_OPEN, 92),
-    ("Download folder\u{2026}", ID_SETDIR, 124),
+    ("Settings\u{2026}", ID_SETTINGS, 88),
 ];
+/// Height of the draggable bar between the torrent list and the details panel.
+const SPLITTER: i32 = 6;
 
 const NCOLS: usize = 9;
 const COLUMNS: [(&str, i32, bool); NCOLS] = [
@@ -87,13 +93,18 @@ struct App {
     buttons: Vec<HWND>,
     rows: Vec<Row>,
     dpi: i32,
+    font: WPARAM,
     ticks: u32,
+    panel: details::Panel,
+    /// Fraction of the available height given to the torrent list.
+    split: f32,
+    dragging: bool,
+    /// Y range of the splitter bar in client coordinates.
+    splitter_y: (i32, i32),
 }
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
-    static INPUT_DONE: Cell<bool> = const { Cell::new(false) };
-    static INPUT_TEXT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Run `f` with the app state. Never panics on re-entrancy: returns None instead.
@@ -164,7 +175,7 @@ pub fn run() {
         CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES,
+            dwICC: ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES,
         };
         InitCommonControlsEx(&icc);
         let hinst = GetModuleHandleW(null());
@@ -180,9 +191,14 @@ pub fn run() {
         wc.hbrBackground = (COLOR_BTNFACE + 1) as usize as HBRUSH;
         wc.lpszClassName = class.as_ptr();
         RegisterClassExW(&wc);
-        let input_class = w(INPUT_CLASS);
-        wc.lpfnWndProc = Some(input_proc);
-        wc.lpszClassName = input_class.as_ptr();
+        let dlg_class = w(dialogs::DLG_CLASS);
+        wc.lpfnWndProc = Some(dialogs::dlg_proc);
+        wc.lpszClassName = dlg_class.as_ptr();
+        RegisterClassExW(&wc);
+        let general_class = w(details::GENERAL_CLASS);
+        wc.lpfnWndProc = Some(details::general_proc);
+        wc.lpszClassName = general_class.as_ptr();
+        wc.hbrBackground = null_mut();
         RegisterClassExW(&wc);
 
         let session = Session::new(Config {
@@ -205,8 +221,8 @@ pub fn run() {
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            scale(1020, dpi),
-            scale(540, dpi),
+            scale(1060, dpi),
+            scale(680, dpi),
             null_mut(),
             null_mut(),
             hinst,
@@ -344,6 +360,7 @@ unsafe fn create_children(hwnd: HWND, hinst: HINSTANCE, session: Arc<Session>, d
             null(),
         );
         SendMessageW(status, WM_SETFONT, font as WPARAM, 1);
+        let panel = details::create(hwnd, hinst, font as WPARAM, dpi);
 
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
@@ -353,15 +370,20 @@ unsafe fn create_children(hwnd: HWND, hinst: HINSTANCE, session: Arc<Session>, d
                 buttons,
                 rows: Vec::new(),
                 dpi,
+                font: font as WPARAM,
                 ticks: 0,
+                panel,
+                split: 0.5,
+                dragging: false,
+                splitter_y: (0, 0),
             });
         });
     }
 }
 
 unsafe fn layout(hwnd: HWND) {
-    let Some((list, status, buttons, dpi)) =
-        with_app(|a| (a.list, a.status, a.buttons.clone(), a.dpi))
+    let Some((list, status, buttons, dpi, split)) =
+        with_app(|a| (a.list, a.status, a.buttons.clone(), a.dpi, a.split))
     else {
         return;
     };
@@ -372,7 +394,7 @@ unsafe fn layout(hwnd: HWND) {
         let mut src: RECT = std::mem::zeroed();
         GetWindowRect(status, &mut src);
         let sh = src.bottom - src.top;
-        let parts = [scale(220, dpi), scale(330, dpi), scale(470, dpi), -1];
+        let parts = [scale(280, dpi), scale(390, dpi), scale(720, dpi), -1];
         SendMessageW(status, SB_SETPARTS, parts.len(), parts.as_ptr() as LPARAM);
 
         let pad = scale(6, dpi);
@@ -384,7 +406,16 @@ unsafe fn layout(hwnd: HWND) {
             x += bw + scale(4, dpi);
         }
         let top = pad * 2 + bh;
-        MoveWindow(list, 0, top, rc.right, (rc.bottom - top - sh).max(0), 1);
+        let avail = (rc.bottom - top - sh).max(0);
+        let gap = scale(SPLITTER, dpi);
+        let min_list = scale(80, dpi).min(avail / 2);
+        let min_panel = scale(140, dpi).min(avail / 2);
+        let list_h = ((avail as f32 * split) as i32)
+            .clamp(min_list, (avail - gap - min_panel).max(min_list));
+        MoveWindow(list, 0, top, rc.right, list_h, 1);
+        let panel_y = top + list_h + gap;
+        with_app(|a| a.splitter_y = (top + list_h, panel_y));
+        details::layout(0, panel_y, rc.right, (rc.bottom - sh - panel_y).max(0));
     }
 }
 
@@ -426,17 +457,28 @@ unsafe fn tick(hwnd: HWND) {
                 SendMessageW(list, LVM_REDRAWITEMS, i, i as LPARAM);
             }
         }
+        let (dl, ul) = session.global_limits();
+        let with_limit = |rate: u64, limit: u64| {
+            if limit > 0 {
+                format!("{} [{}]", fmt_or_zero(rate), fmt_rate(limit))
+            } else {
+                fmt_or_zero(rate)
+            }
+        };
         let parts = [
             format!(
                 "\u{2193} {}   \u{2191} {}",
-                fmt_or_zero(down),
-                fmt_or_zero(up)
+                with_limit(down, dl),
+                with_limit(up, ul)
             ),
             match session.dht_nodes() {
                 Some(n) => format!("DHT: {} nodes", n),
                 None => "DHT: off".into(),
             },
-            format!("Port: {}", session.port()),
+            match session.portmap_status() {
+                Some(pm) => format!("Port {}: {}", session.port(), pm),
+                None => format!("Port: {}", session.port()),
+            },
             format!(
                 "Saving to: {}",
                 session
@@ -461,6 +503,7 @@ unsafe fn tick(hwnd: HWND) {
         };
         let t = w(&title);
         SetWindowTextW(hwnd, t.as_ptr());
+        details::refresh(hwnd);
     }
     if save_now && session.any_dirty() {
         session.save();
@@ -471,21 +514,27 @@ fn fmt_or_zero(n: u64) -> String {
     if n == 0 { "0 B/s".into() } else { fmt_rate(n) }
 }
 
-unsafe fn selected_ids() -> Vec<u64> {
-    let Some(list) = with_app(|a| a.list) else {
-        return Vec::new();
-    };
+/// Indices of the selected rows of a list view.
+unsafe fn selected_rows(list: HWND) -> Vec<usize> {
     let mut idx: isize = -1;
     let mut out = Vec::new();
     loop {
         let r =
             unsafe { SendMessageW(list, LVM_GETNEXTITEM, idx as usize, LVNI_SELECTED as LPARAM) };
-        if r < 0 || out.len() > 100_000 {
+        if r < 0 || out.len() > 1_000_000 {
             break;
         }
         idx = r;
         out.push(r as usize);
     }
+    out
+}
+
+unsafe fn selected_ids() -> Vec<u64> {
+    let Some(list) = with_app(|a| a.list) else {
+        return Vec::new();
+    };
+    let out = unsafe { selected_rows(list) };
     with_app(|a| {
         out.iter()
             .filter_map(|&i| a.rows.get(i).map(|r| r.id))
@@ -510,6 +559,8 @@ unsafe fn add_item(hwnd: HWND, item: &str) {
     }
     let res = if item.to_ascii_lowercase().starts_with("magnet:") {
         session.add_magnet(item)
+    } else if session.settings().ask_files {
+        unsafe { add_torrent_interactive(hwnd, &session, std::path::Path::new(item)) }
     } else {
         session.add_torrent_file(std::path::Path::new(item))
     };
@@ -523,6 +574,28 @@ unsafe fn add_item(hwnd: HWND, item: &str) {
         };
     }
     unsafe { tick(hwnd) };
+}
+
+/// Show the file selection dialog for a .torrent before adding it.
+unsafe fn add_torrent_interactive(
+    hwnd: HWND,
+    session: &Session,
+    path: &std::path::Path,
+) -> crate::util::Result<u64> {
+    let len = std::fs::metadata(path)?.len();
+    if len > 64 << 20 {
+        crate::bail!("file is too large to be a torrent");
+    }
+    let data = std::fs::read(path)?;
+    let (meta, _) = Metainfo::from_torrent(&data)?;
+    if session.contains(&meta.info_hash) {
+        return session.add_torrent_bytes(&data);
+    }
+    let dir = session.download_dir.lock().unwrap().clone();
+    match unsafe { dialogs::add_torrent(hwnd, &meta, &dir) } {
+        Some(opts) => session.add_torrent_with(&data, opts),
+        None => Ok(0),
+    }
 }
 
 unsafe fn add_lines(hwnd: HWND, text: &str) {
@@ -736,7 +809,16 @@ unsafe fn command(hwnd: HWND, id: usize) {
                 }
             }
             ID_MAGNET => {
-                if let Some(text) = input_dialog(hwnd) {
+                let initial = clipboard_text(hwnd)
+                    .filter(|t| t.trim_start().to_ascii_lowercase().starts_with("magnet:"))
+                    .unwrap_or_default();
+                if let Some(text) = dialogs::text_input(
+                    hwnd,
+                    "Add magnet links",
+                    "Paste one or more magnet links (one per line):",
+                    &initial,
+                    "Add",
+                ) {
                     add_lines(hwnd, &text);
                 }
             }
@@ -771,15 +853,39 @@ unsafe fn command(hwnd: HWND, id: usize) {
                     set_clipboard(hwnd, &links.join("\r\n"));
                 }
             }
-            ID_SETDIR => {
-                if let Some(dir) = browse_folder(hwnd) {
-                    if let Ok(mut d) = session.download_dir.lock() {
-                        *d = dir;
+            ID_SETTINGS => {
+                let cur = session.settings();
+                if let Some(new) = dialogs::settings(hwnd, &cur, session.port()) {
+                    if new != cur && session.apply_settings(new) {
+                        message(
+                            hwnd,
+                            "Some changes (port or DHT) will take effect the next time rustorrent starts.",
+                            MB_OK | MB_ICONINFORMATION,
+                        );
                     }
-                    session.save();
                 }
             }
-            _ => return,
+            ID_LIMIT => {
+                let ids = selected_ids();
+                if let Some(&first) = ids.first() {
+                    let cur = session.torrent_limits(first).unwrap_or((0, 0));
+                    if let Some((d, u)) = dialogs::speed_limit(hwnd, ids.len(), cur) {
+                        for id in ids {
+                            session.set_torrent_limits(id, d, u);
+                        }
+                    }
+                }
+            }
+            ID_REANNOUNCE => {
+                for id in selected_ids() {
+                    session.reannounce(id);
+                }
+            }
+            _ => {
+                if !details::command(hwnd, id) {
+                    return;
+                }
+            }
         }
         tick(hwnd);
     }
@@ -791,19 +897,29 @@ unsafe fn context_menu(hwnd: HWND) {
         return;
     }
     unsafe {
+        popup_menu(
+            hwnd,
+            &[
+                (ID_START, "Start"),
+                (ID_PAUSE, "Pause"),
+                (0, ""),
+                (ID_OPEN, "Open folder"),
+                (ID_COPY_MAGNET, "Copy magnet link"),
+                (ID_LIMIT, "Speed limit\u{2026}"),
+                (ID_RECHECK, "Force recheck"),
+                (ID_REANNOUNCE, "Force reannounce"),
+                (0, ""),
+                (ID_REMOVE, "Remove\tDel"),
+                (ID_REMOVE_DELETE, "Remove and delete files\tShift+Del"),
+            ],
+        );
+    }
+}
+
+unsafe fn popup_menu(hwnd: HWND, items: &[(usize, &str)]) {
+    unsafe {
         let menu = CreatePopupMenu();
-        let items: [(usize, &str); 9] = [
-            (ID_START, "Start"),
-            (ID_PAUSE, "Pause"),
-            (0, ""),
-            (ID_OPEN, "Open folder"),
-            (ID_COPY_MAGNET, "Copy magnet link"),
-            (ID_RECHECK, "Force recheck"),
-            (0, ""),
-            (ID_REMOVE, "Remove\tDel"),
-            (ID_REMOVE_DELETE, "Remove and delete files\tShift+Del"),
-        ];
-        for (id, text) in items {
+        for &(id, text) in items {
             if id == 0 {
                 AppendMenuW(menu, MF_SEPARATOR, 0, null());
             } else {
@@ -829,14 +945,36 @@ unsafe fn draw_progress(cd: &NMLVCUSTOMDRAW, list: HWND) {
         return;
     };
     unsafe {
+        draw_bar(
+            cd.nmcd.hdc,
+            list,
+            item,
+            PROGRESS_COL,
+            progress,
+            color,
+            &text,
+        )
+    };
+}
+
+/// Draw a progress bar with centred text into a list-view cell.
+unsafe fn draw_bar(
+    hdc: HDC,
+    list: HWND,
+    item: usize,
+    col: i32,
+    progress: f64,
+    color: COLORREF,
+    text: &str,
+) {
+    unsafe {
         let mut rc = RECT {
             left: LVIR_BOUNDS as i32,
-            top: PROGRESS_COL,
+            top: col,
             right: 0,
             bottom: 0,
         };
         SendMessageW(list, LVM_GETSUBITEMRECT, item, &mut rc as *mut _ as LPARAM);
-        let hdc = cd.nmcd.hdc;
         FillRect(hdc, &rc, GetSysColorBrush(COLOR_WINDOW));
         let mut bar = RECT {
             left: rc.left + 3,
@@ -869,10 +1007,63 @@ unsafe fn draw_progress(cd: &NMLVCUSTOMDRAW, list: HWND) {
     }
 }
 
+/// Notifications from the details panel (tab control and its lists).
+unsafe fn on_panel_notify(hwnd: HWND, hdr: &NMHDR, lparam: LPARAM) -> Option<LRESULT> {
+    unsafe {
+        if hdr.idFrom == details::IDC_TAB {
+            if hdr.code == TCN_SELCHANGE {
+                details::tab_changed(hwnd);
+            }
+            return Some(0);
+        }
+        let which = with_app(|a| a.panel.list_index(hdr.hwndFrom)).flatten()?;
+        match hdr.code {
+            LVN_GETDISPINFOW => {
+                details::dispinfo(which, &mut *(lparam as *mut NMLVDISPINFOW));
+                Some(0)
+            }
+            NM_CUSTOMDRAW if which == 2 => {
+                let cd = &*(lparam as *const NMLVCUSTOMDRAW);
+                let stage = cd.nmcd.dwDrawStage;
+                Some(if stage == CDDS_PREPAINT {
+                    CDRF_NOTIFYITEMDRAW as LRESULT
+                } else if stage == CDDS_ITEMPREPAINT {
+                    CDRF_NOTIFYSUBITEMDRAW as LRESULT
+                } else if stage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM)
+                    && cd.iSubItem == details::FILE_PROGRESS_COL
+                {
+                    details::draw_file_progress(cd, hdr.hwndFrom);
+                    CDRF_SKIPDEFAULT as LRESULT
+                } else {
+                    CDRF_DODEFAULT as LRESULT
+                })
+            }
+            NM_RCLICK => {
+                details::context_menu(hwnd, which);
+                Some(0)
+            }
+            NM_CLICK if which == 2 => {
+                details::on_files_click(hdr.hwndFrom, lparam);
+                Some(0)
+            }
+            NM_DBLCLK if which == 2 => {
+                details::command(hwnd, details::ID_FILE_OPEN);
+                Some(0)
+            }
+            LVN_KEYDOWN if which == 2 => {
+                let kd = &*(lparam as *const NMLVKEYDOWN);
+                details::on_files_key(hdr.hwndFrom, kd.wVKey);
+                Some(0)
+            }
+            _ => None,
+        }
+    }
+}
+
 unsafe fn on_notify(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
     let hdr = unsafe { &*(lparam as *const NMHDR) };
     if hdr.idFrom != IDC_LIST {
-        return None;
+        return unsafe { on_panel_notify(hwnd, hdr, lparam) };
     }
     unsafe {
         match hdr.code {
@@ -925,6 +1116,20 @@ unsafe fn on_notify(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
                 }
                 Some(0)
             }
+            LVN_ITEMCHANGED => {
+                let nm = &*(lparam as *const NMLISTVIEW);
+                if nm.uChanged & LVIF_STATE != 0
+                    && (nm.uOldState ^ nm.uNewState) & LVIS_SELECTED != 0
+                {
+                    // Show the newly selected torrent right away (after the click settles).
+                    PostMessageW(hwnd, WM_APP_REFRESH, 0, 0);
+                }
+                Some(0)
+            }
+            LVN_ODSTATECHANGED => {
+                PostMessageW(hwnd, WM_APP_REFRESH, 0, 0);
+                Some(0)
+            }
             LVN_KEYDOWN => {
                 let kd = &*(lparam as *const NMLVKEYDOWN);
                 if kd.wVKey == VK_DELETE {
@@ -966,6 +1171,44 @@ unsafe extern "system" fn main_proc(
             }
             WM_TIMER => {
                 tick(hwnd);
+                0
+            }
+            WM_APP_REFRESH => {
+                // Collapse bursts of selection changes into one refresh.
+                let mut m: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut m, hwnd, WM_APP_REFRESH, WM_APP_REFRESH, PM_REMOVE) != 0 {}
+                with_app(|a| a.panel.rows = Default::default());
+                details::refresh(hwnd);
+                0
+            }
+            WM_SETCURSOR => {
+                if (lparam & 0xffff) as u32 == HTCLIENT && over_splitter(hwnd) {
+                    SetCursor(LoadCursorW(null_mut(), IDC_SIZENS));
+                    1
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+            }
+            WM_LBUTTONDOWN => {
+                if over_splitter(hwnd) {
+                    with_app(|a| a.dragging = true);
+                    SetCapture(hwnd);
+                }
+                0
+            }
+            WM_MOUSEMOVE => {
+                if with_app(|a| a.dragging).unwrap_or(false) {
+                    let y = ((lparam >> 16) & 0xffff) as i16 as i32;
+                    drag_splitter(hwnd, y);
+                }
+                0
+            }
+            WM_LBUTTONUP | WM_CAPTURECHANGED => {
+                if with_app(|a| std::mem::replace(&mut a.dragging, false)).unwrap_or(false)
+                    && msg == WM_LBUTTONUP
+                {
+                    ReleaseCapture();
+                }
                 0
             }
             WM_COMMAND => {
@@ -1021,184 +1264,33 @@ unsafe extern "system" fn main_proc(
     }
 }
 
-// ---- magnet input window ----
+const WM_APP_REFRESH: u32 = WM_APP + 1;
 
-unsafe extern "system" fn input_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe fn over_splitter(hwnd: HWND) -> bool {
     unsafe {
-        match msg {
-            WM_COMMAND => {
-                let id = (wparam & 0xffff) as i32;
-                if id == IDOK {
-                    let edit = GetDlgItem(hwnd, IDC_INPUT_EDIT as i32);
-                    let len = GetWindowTextLengthW(edit).max(0) as usize;
-                    let mut buf = vec![0u16; len + 1];
-                    GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32);
-                    INPUT_TEXT
-                        .with(|t| *t.borrow_mut() = Some(String::from_utf16_lossy(&buf[..len])));
-                    INPUT_DONE.with(|d| d.set(true));
-                } else if id == IDCANCEL {
-                    INPUT_DONE.with(|d| d.set(true));
-                }
-                0
-            }
-            WM_CLOSE => {
-                INPUT_DONE.with(|d| d.set(true));
-                0
-            }
-            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-        }
+        let mut pt: POINT = std::mem::zeroed();
+        GetCursorPos(&mut pt);
+        ScreenToClient(hwnd, &mut pt);
+        with_app(|a| pt.y >= a.splitter_y.0 && pt.y < a.splitter_y.1).unwrap_or(false)
     }
 }
 
-unsafe fn input_dialog(parent: HWND) -> Option<String> {
-    let dpi = with_app(|a| a.dpi).unwrap_or(96);
-    let s = |v| scale(v, dpi);
+unsafe fn drag_splitter(hwnd: HWND, y: i32) {
+    let Some((list, status)) = with_app(|a| (a.list, a.status)) else {
+        return;
+    };
     unsafe {
-        let hinst = GetModuleHandleW(null());
-        let class = w(INPUT_CLASS);
-        let title = w("Add magnet links");
-        let (width, height) = (s(560), s(250));
-        let mut prc: RECT = std::mem::zeroed();
-        GetWindowRect(parent, &mut prc);
-        let x = prc.left + ((prc.right - prc.left) - width) / 2;
-        let y = prc.top + ((prc.bottom - prc.top) - height) / 2;
-        let dlg = CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
-            class.as_ptr(),
-            title.as_ptr(),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
-            x,
-            y,
-            width,
-            height,
-            parent,
-            null_mut(),
-            hinst,
-            null(),
-        );
-        if dlg.is_null() {
-            return None;
-        }
-        let mut crc: RECT = std::mem::zeroed();
-        GetClientRect(dlg, &mut crc);
-        let font = SendMessageW(parent, WM_GETFONT, 0, 0);
-        let font = if font == 0 {
-            with_app(|a| SendMessageW(a.list, WM_GETFONT, 0, 0)).unwrap_or(0)
-        } else {
-            font
-        };
-        let pad = s(10);
-        let label_class = w("STATIC");
-        let label_text = w("Paste one or more magnet links (one per line):");
-        let label = CreateWindowExW(
-            0,
-            label_class.as_ptr(),
-            label_text.as_ptr(),
-            WS_CHILD | WS_VISIBLE,
-            pad,
-            pad,
-            crc.right - 2 * pad,
-            s(18),
-            dlg,
-            null_mut(),
-            hinst,
-            null(),
-        );
-        let edit_class = w("EDIT");
-        let initial = clipboard_text(parent)
-            .filter(|t| t.trim_start().to_ascii_lowercase().starts_with("magnet:"))
-            .unwrap_or_default();
-        let initial = w(&initial.replace("\r\n", "\n").replace('\n', "\r\n"));
-        let bh = s(28);
-        let edit = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            edit_class.as_ptr(),
-            initial.as_ptr(),
-            WS_CHILD
-                | WS_VISIBLE
-                | WS_TABSTOP
-                | WS_VSCROLL
-                | (ES_MULTILINE | ES_AUTOVSCROLL) as u32,
-            pad,
-            pad + s(22),
-            crc.right - 2 * pad,
-            crc.bottom - 3 * pad - s(22) - bh,
-            dlg,
-            IDC_INPUT_EDIT as HMENU,
-            hinst,
-            null(),
-        );
-        let button_class = w("BUTTON");
-        let ok_text = w("Add");
-        let cancel_text = w("Cancel");
-        let bw = s(88);
-        let ok = CreateWindowExW(
-            0,
-            button_class.as_ptr(),
-            ok_text.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
-            crc.right - pad - 2 * bw - s(6),
-            crc.bottom - pad - bh,
-            bw,
-            bh,
-            dlg,
-            IDOK as usize as HMENU,
-            hinst,
-            null(),
-        );
-        let cancel = CreateWindowExW(
-            0,
-            button_class.as_ptr(),
-            cancel_text.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32,
-            crc.right - pad - bw,
-            crc.bottom - pad - bh,
-            bw,
-            bh,
-            dlg,
-            IDCANCEL as usize as HMENU,
-            hinst,
-            null(),
-        );
-        for c in [label, edit, ok, cancel] {
-            SendMessageW(c, WM_SETFONT, font as WPARAM, 1);
-        }
-        SendMessageW(edit, EM_SETSEL, 0, -1);
-
-        INPUT_DONE.with(|d| d.set(false));
-        INPUT_TEXT.with(|t| *t.borrow_mut() = None);
-        EnableWindow(parent, 0);
-        ShowWindow(dlg, SW_SHOW);
-        SetFocus(edit);
-        let mut msg: MSG = std::mem::zeroed();
-        let mut quit = false;
-        while !INPUT_DONE.with(|d| d.get()) {
-            let r = GetMessageW(&mut msg, null_mut(), 0, 0);
-            if r <= 0 {
-                quit = true;
-                break;
-            }
-            // Ctrl+Enter in the edit box confirms, like Enter does for single-line input.
-            if msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN as usize && msg.hwnd == edit {
-                SendMessageW(dlg, WM_COMMAND, IDOK as usize, 0);
-                continue;
-            }
-            if IsDialogMessageW(dlg, &msg) == 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        EnableWindow(parent, 1);
-        SetForegroundWindow(parent);
-        DestroyWindow(dlg);
-        if quit {
-            PostQuitMessage(0);
-        }
-        INPUT_TEXT.with(|t| t.borrow_mut().take())
+        let mut lr: RECT = std::mem::zeroed();
+        GetWindowRect(list, &mut lr);
+        let mut top = POINT { x: 0, y: lr.top };
+        ScreenToClient(hwnd, &mut top);
+        let mut rc: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut rc);
+        let mut src: RECT = std::mem::zeroed();
+        GetWindowRect(status, &mut src);
+        let avail = (rc.bottom - top.y - (src.bottom - src.top)).max(1);
+        let split = ((y - top.y) as f32 / avail as f32).clamp(0.1, 0.9);
+        with_app(|a| a.split = split);
+        layout(hwnd);
     }
 }
